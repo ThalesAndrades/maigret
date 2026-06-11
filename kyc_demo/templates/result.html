@@ -1,0 +1,45 @@
+{% extends "base.html" %}
+{% block body %}
+
+{% set st = result.status %}
+<div class="card">
+  <h2>Resultado da verificação</h2>
+  <p>
+    Status:
+    {% if st == 'aprovado' %}<span class="pill ok">APROVADO</span>
+    {% elif st == 'em_revisao' %}<span class="pill warn">EM REVISÃO</span>
+    {% else %}<span class="pill bad">RECUSADO</span>{% endif %}
+    {% if result.reason %}<span class="muted">— {{ result.reason }}</span>{% endif %}
+  </p>
+  <p class="muted">
+    Sessão <code>{{ session_id }}</code> ·
+    Verificação <code>{{ result.verification_id[:8] }}</code> ·
+    Revisão humana necessária: <b>{{ 'sim' if result.review_required else 'não' }}</b>
+  </p>
+</div>
+
+<div class="card">
+  <h2>Etapas executadas</h2>
+  <table>
+    <tr><th>Etapa</th><th>Resultado</th><th>Detalhe (vereditos/scores)</th></tr>
+    {% for nome, res, detalhe in result.steps %}
+    <tr>
+      <td>{{ nome }}</td>
+      <td>
+        {% if res == 'OK' %}<span class="pill ok">{{ res }}</span>
+        {% elif res in ['FALHA','BAIXO'] %}<span class="pill bad">{{ res }}</span>
+        {% else %}<span class="pill warn">{{ res }}</span>{% endif %}
+      </td>
+      <td class="muted">{{ detalhe }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <p class="muted" style="margin-top:12px">
+    Observação de conformidade: nenhuma imagem ou PII verdadeiro foi
+    persistido — só vereditos, scores e referências. A biometria efêmera foi
+    descartada após a decisão (ver eventos <code>biometrics_purged</code>).</p>
+</div>
+
+<a href="/">← Voltar e ver auditoria / fila de revisão</a>
+
+{% endblock %}

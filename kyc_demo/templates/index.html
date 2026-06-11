@@ -1,0 +1,86 @@
+{% extends "base.html" %}
+{% block body %}
+
+<div class="card">
+  <h2>Fluxo</h2>
+  <div class="flow">
+    {% for s in states %}<span>{{ loop.index }}. {{ s }}</span>{% endfor %}
+  </div>
+  <p class="muted">Consentimento (cadastral + biometria em escopos separados) →
+    validação cadastral → prova de vida + match facial → antifraude → decisão.
+    Casos limítrofes vão para revisão humana (art. 20).</p>
+</div>
+
+<div class="grid">
+  <div class="card">
+    <h2>Simular um cliente</h2>
+    <form method="post" action="/run">
+      <label>Nome completo</label>
+      <input name="nome" value="FULANO DE TAL" required>
+      <label>CPF (use dígitos verificadores válidos)</label>
+      <input name="cpf" value="52998224725" required>
+      <label>Data de nascimento</label>
+      <input name="nascimento" type="date" value="1990-05-20" required>
+      <label>Token da selfie (demo)</label>
+      <select name="selfie_ref">
+        <option value="selfie-ok">selfie-ok (aprova)</option>
+        <option value="low-quality">low-quality (similaridade limítrofe → revisão)</option>
+        <option value="spoof-attack">spoof-attack (liveness falha → recusa)</option>
+      </select>
+      <button type="submit">▶ Rodar verificação</button>
+    </form>
+    <p class="muted" style="margin-top:14px">
+      Caminhos de demonstração: CPF <b>válido</b> + selfie-ok → aprova;
+      nome contendo <code>DIVERGE</code> → recusa no cadastral;
+      CPF inválido (ex.: <code>11111111111</code>) → recusa no cadastral;
+      selfie <code>low-quality</code> → revisão; <code>spoof-attack</code> →
+      recusa por liveness. CPF válido de teste: <code>52998224725</code>.</p>
+  </div>
+
+  <div class="card">
+    <h2>Fila de revisão humana</h2>
+    {% if reviews %}
+    <table>
+      <tr><th>Verificação</th><th>Motivo</th><th>Sim.</th><th>Ação</th></tr>
+      {% for r in reviews %}
+      <tr>
+        <td><code>{{ r.id[:8] }}</code></td>
+        <td>{{ r.reason }}</td>
+        <td>{{ '%.3f'|format(r.face_similarity or 0) }}</td>
+        <td>
+          <form method="post" action="/review/{{ r.id }}" style="display:flex;gap:6px">
+            <button class="ok" name="decision" value="aprovado">Aprovar</button>
+            <button class="bad" name="decision" value="recusado">Recusar</button>
+          </form>
+        </td>
+      </tr>
+      {% endfor %}
+    </table>
+    {% else %}<p class="muted">Nenhum caso pendente.</p>{% endif %}
+  </div>
+</div>
+
+<div class="card">
+  <h2>Trilha de auditoria
+    {% if chain_ok %}<span class="pill ok">cadeia íntegra ✓</span>
+    {% else %}<span class="pill bad">cadeia adulterada ✗</span>{% endif %}
+  </h2>
+  <table>
+    <tr><th>#</th><th>Evento</th><th>Sujeito</th><th>Hash (sha256)</th><th>Quando</th></tr>
+    {% for a in audit %}
+    <tr>
+      <td>{{ a.id }}</td>
+      <td><code>{{ a.event }}</code></td>
+      <td class="muted">{{ (a.subject_id or '')[:8] }}</td>
+      <td class="muted">{{ a.hash[:16] }}…</td>
+      <td class="muted">{{ a.created_at[11:19] }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+  <form method="post" action="/reset"><button class="ghost">↺ Resetar demo</button></form>
+</div>
+
+<p class="muted">API REST disponível em <code>/v1/kyc/...</code> e
+  <code>/v1/audit</code> — é o contrato que um app mobile consumiria.</p>
+
+{% endblock %}
