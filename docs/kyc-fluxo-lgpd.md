@@ -427,7 +427,196 @@ quebra a verificação das seguintes. Idealmente WORM/append-only no storage.
 | Consentimento | `consent_record` | Enquanto durar a relação + prazo legal |
 | Trilha de auditoria | `audit_log` | Prazo legal/regulatório |
 
-## 13. Checklist de conformidade antes de ir para produção
+## 13. Contrato da API do seu backend (consumida pelo app)
+
+> Este é o **contrato entre o app mobile e o seu backend** — não confundir com
+> as APIs dos provedores (que só o backend chama). O app fala apenas com estes
+> endpoints, sobre HTTPS (idealmente mTLS).
+
+### 13.1 Visão geral dos endpoints
+
+| Método | Rota | Função |
+|---|---|---|
+| `POST` | `/v1/kyc/sessions` | Inicia uma sessão de verificação; devolve token e config de captura |
+| `POST` | `/v1/kyc/{session}/consent` | Registra consentimento (cadastral + biometria) |
+| `POST` | `/v1/kyc/{session}/identity` | Envia nome, CPF, data de nascimento |
+| `POST` | `/v1/kyc/{session}/biometrics` | Envia selfie/liveness e imagem do documento |
+| `POST` | `/v1/kyc/{session}/submit` | Dispara a orquestração e a decisão |
+| `GET`  | `/v1/kyc/{session}` | Consulta status atual da sessão |
+
+A sessão é uma **máquina de estados**: `created → consent_given →
+identity_provided → biometrics_provided → processing → {approved | review |
+rejected}`. Cada POST só é aceito no estado correto (evita pular etapas).
+
+### 13.2 Exemplos de request/response
+
+**Iniciar sessão**
+```http
+POST /v1/kyc/sessions
+Authorization: Bearer <token-do-app>
+```
+```json
+{
+  "session_id": "f1c2...",
+  "expires_at": "2026-06-11T20:10:00Z",
+  "capture_config": { "liveness": "active", "min_face_score": 0.90 }
+}
+```
+
+**Registrar consentimento** (biometria em escopo separado)
+```http
+POST /v1/kyc/f1c2.../consent
+```
+```json
+{
+  "policy_version": "2026-05",
+  "terms_version": "2026-05",
+  "scopes": ["cadastral", "biometria"]
+}
+```
+```json
+{ "status": "consent_given", "consent_ref": "9add..." }
+```
+
+**Enviar identidade**
+```json
+{ "nome": "FULANO DE TAL", "cpf": "12345678909", "data_nascimento": "1990-05-20" }
+```
+
+**Enviar biometria** — preferir **upload direto a storage cifrado** via URL
+pré-assinada; o app manda só as referências ao backend, não o binário pela API
+de negócio:
+```json
+{ "selfie_ref": "s3://efemero/...", "documento_ref": "s3://efemero/...",
+  "liveness_token": "<token-do-SDK>" }
+```
+
+**Submeter e obter decisão**
+```json
+{ "status": "approved", "verification_id": "a1b2...", "review_required": false }
+```
+
+Estados de resposta possíveis: `approved`, `review` (revisão humana pendente),
+`rejected` (com `reason`). O app **nunca** recebe os dados brutos de validação,
+só o veredito.
+
+### 13.3 Boas práticas do contrato
+
+- **Idempotência** no `submit` (header `Idempotency-Key`) para evitar dupla
+  cobrança de provedor em retry de rede.
+- **Expiração curta** da sessão; binário de biometria some por TTL.
+- **Mensagens de erro genéricas** ao cliente; o detalhe vai só para o `audit_log`.
+- **Rate limiting** por device/subject para conter abuso.
+
+## 14. DDL SQL (PostgreSQL) das tabelas
+
+> Esquema de referência. Ajuste tipos/índices ao seu SGBD e volume. Tudo que é
+> trilha é **append-only**.
+
+```sql
+-- Titular pseudonimizado (o PII real vive cifrado em outro domínio/serviço)
+CREATE TABLE subject (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    external_ref  TEXT UNIQUE,                 -- id do cliente no seu sistema
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+
+-- Consentimento: append-only, 1 linha por (subject, scope) por evento
+CREATE TABLE consent_record (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    subject_id      UUID NOT NULL REFERENCES subject(id),
+    scope           TEXT NOT NULL CHECK (scope IN ('cadastral','biometria')),
+    granted         BOOLEAN NOT NULL,
+    policy_version  TEXT NOT NULL,
+    terms_version   TEXT NOT NULL,
+    legal_basis     TEXT NOT NULL CHECK (legal_basis IN
+                       ('contrato','obrigacao_legal','consentimento')),
+    ip              INET,
+    device_id       TEXT,
+    user_agent      TEXT,
+    prev_id         UUID REFERENCES consent_record(id),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_consent_subject_scope ON consent_record(subject_id, scope, created_at DESC);
+
+-- Estado atual do consentimento (view: última linha por subject+scope)
+CREATE VIEW consent_current AS
+SELECT DISTINCT ON (subject_id, scope)
+       subject_id, scope, granted, legal_basis, created_at
+FROM   consent_record
+ORDER  BY subject_id, scope, created_at DESC;
+
+-- Verificação/decisão: guarda vereditos e scores, NUNCA imagem ou PII verdadeiro
+CREATE TABLE kyc_verification (
+    id              UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    subject_id      UUID NOT NULL REFERENCES subject(id),
+    status          TEXT NOT NULL CHECK (status IN
+                       ('aprovado','em_revisao','recusado')),
+    reason          TEXT,
+    decided_by      TEXT NOT NULL DEFAULT 'auto',   -- 'auto' ou id do analista
+    cadastral_ok    BOOLEAN,
+    liveness_ok     BOOLEAN,
+    face_similarity NUMERIC(4,3),
+    risk_flags      JSONB,
+    provider_refs   JSONB,
+    consent_ref     UUID REFERENCES consent_record(id),
+    created_at      TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_verif_subject ON kyc_verification(subject_id, created_at DESC);
+CREATE INDEX idx_verif_status  ON kyc_verification(status) WHERE status = 'em_revisao';
+
+-- Trilha imutável com hash encadeado (ledger)
+CREATE TABLE audit_log (
+    id          BIGSERIAL PRIMARY KEY,
+    event       TEXT NOT NULL,
+    subject_id  UUID,
+    payload     JSONB NOT NULL,
+    prev_hash   TEXT,
+    hash        TEXT NOT NULL,           -- sha256(payload || prev_hash)
+    created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
+);
+CREATE INDEX idx_audit_subject ON audit_log(subject_id, created_at);
+
+-- Proteções de imutabilidade (defesa em profundidade)
+REVOKE UPDATE, DELETE ON consent_record, audit_log FROM PUBLIC;
+```
+
+Notas:
+- Em produção, reforce a imutabilidade com **trigger** que bloqueia
+  `UPDATE/DELETE` em `audit_log`/`consent_record`, ou use storage **WORM**.
+- O PII real (nome/CPF/imagens) **não** fica nessas tabelas — só referências e
+  vereditos. Imagens vivem em storage cifrado efêmero com TTL.
+
+## 15. Fluxo de revisão humana (estado `em_revisao`)
+
+A LGPD (art. 20) garante ao titular pedir **revisão de decisões automatizadas**.
+Casos `em_revisao` (similaridade limítrofe, lista restritiva, situação cadastral
+não-regular) vão para uma fila de analista.
+
+```mermaid
+stateDiagram-v2
+    [*] --> processing
+    processing --> aprovado: regras OK
+    processing --> recusado: divergência clara
+    processing --> em_revisao: caso limítrofe
+    em_revisao --> aprovado: analista aprova
+    em_revisao --> recusado: analista recusa
+    aprovado --> [*]
+    recusado --> contestacao: titular contesta (art. 20)
+    contestacao --> em_revisao: reabre p/ análise
+```
+
+Requisitos da tela/processo do analista:
+
+- Mostra **só o necessário** para decidir (vereditos, scores, motivo da flag);
+  acesso à imagem apenas se indispensável, com **log de quem visualizou**.
+- Toda decisão humana grava `decided_by = <id do analista>` e um evento no
+  `audit_log`.
+- **Segregação de função** e RBAC: analista não mexe em configuração de regras.
+- **SLA** de revisão definido e comunicado ao cliente.
+- Canal para o titular **contestar** uma recusa, reabrindo o caso.
+
+## 16. Checklist de conformidade antes de ir para produção
 
 - [ ] Aviso de privacidade e termo de consentimento (biometria em destaque).
 - [ ] DPA assinado com cada provedor (papel de operador definido).
