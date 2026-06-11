@@ -216,7 +216,218 @@ def decide(status: str, motivo: str = "") -> KycDecision:
     return KycDecision(status=status, motivo=motivo, revisao_humana=(status != "aprovado"))
 ```
 
-## 11. Checklist de conformidade antes de ir para produção
+## 11. Integração com o Serpro Datavalid (validação cadastral)
+
+> O **Datavalid** valida atributos contra a base oficial (Receita Federal,
+> Denatran). Ele **confirma** ("bate ou não bate") em vez de **devolver** os
+> dados — exatamente o que o KYC legítimo precisa. Os detalhes abaixo seguem o
+> modelo da API REST do Datavalid; confirme campos e versão no contrato/portal
+> Serpro, pois variam por plano (PF, PF + biometria facial).
+
+### 11.1 Autenticação (OAuth2 client credentials)
+
+O acesso usa **OAuth2 `client_credentials`**. O backend troca
+`consumer_key:consumer_secret` por um `access_token` de curta duração e o usa
+como `Bearer` nas chamadas. As credenciais ficam no **vault**.
+
+```http
+POST /token HTTP/1.1
+Host: gateway.apiserpro.serpro.gov.br
+Authorization: Basic base64(consumer_key:consumer_secret)
+Content-Type: application/x-www-form-urlencoded
+
+grant_type=client_credentials
+```
+
+```json
+{ "access_token": "eyJ...", "token_type": "Bearer", "expires_in": 3600 }
+```
+
+Cacheie o token até perto de `expires_in` e renove sob demanda (não peça um
+token por requisição).
+
+### 11.2 Validação cadastral (PF) — request/response
+
+Envia-se o CPF como **chave** e os atributos a conferir; a resposta traz um
+booleano por atributo. **Não** se recebe o valor verdadeiro de volta.
+
+```http
+POST /datavalid-demonstracao/v3/pessoa-fisica HTTP/1.1
+Authorization: Bearer eyJ...
+Content-Type: application/json
+
+{
+  "key": { "cpf": "12345678909" },
+  "answer": {
+    "nome": "FULANO DE TAL",
+    "data_nascimento": "1990-05-20"
+  }
+}
+```
+
+```json
+{
+  "cpf_disponivel": true,
+  "cpf_situacao_cadastral": "REGULAR",
+  "nome": true,
+  "data_nascimento": true
+}
+```
+
+Interpretação:
+
+- `cpf_disponivel: false` → CPF inexistente/irregular na base → **recusar**.
+- `cpf_situacao_cadastral` ≠ `REGULAR` → tratar conforme política (ex.: revisão).
+- `nome`/`data_nascimento: false` → o atributo informado **não confere** →
+  **recusar** por divergência cadastral.
+
+### 11.3 Biometria facial (opcional, mesmo provedor)
+
+Alguns planos do Datavalid comparam a **selfie** contra a foto da base
+oficial, retornando uma **similaridade** e/ou booleano de match:
+
+```json
+{ "key": { "cpf": "12345678909" },
+  "answer": { "biometria_face": "<base64-da-selfie>" } }
+```
+```json
+{ "biometria_face": true, "biometria_face_similaridade": 0.93 }
+```
+
+Você pode usar isso como etapa de match facial **ou** combinar com um provedor
+de liveness dedicado (Unico/idwall/CAF), que costuma ter prova de vida mais
+robusta. Defina o **limiar** (ex.: ≥ 0,90) com base no apetite a risco.
+
+### 11.4 Cliente de exemplo (esboço)
+
+```python
+class DatavalidClient:
+    def __init__(self, vault):
+        self._cfg = vault.get("datavalid")   # consumer_key, secret, base_url
+        self._token = None
+        self._token_exp = 0
+
+    async def _auth(self) -> str:
+        if self._token and time.time() < self._token_exp - 60:
+            return self._token
+        resp = await http.post(
+            f"{self._cfg.base_url}/token",
+            headers={"Authorization": basic(self._cfg.key, self._cfg.secret)},
+            data={"grant_type": "client_credentials"},
+        )
+        data = resp.json()
+        self._token = data["access_token"]
+        self._token_exp = time.time() + data["expires_in"]
+        return self._token
+
+    async def validar(self, *, nome: str, cpf: str, nascimento: str) -> CadastralResult:
+        token = await self._auth()
+        resp = await http.post(
+            f"{self._cfg.base_url}/v3/pessoa-fisica",
+            headers={"Authorization": f"Bearer {token}"},
+            json={"key": {"cpf": cpf},
+                  "answer": {"nome": nome, "data_nascimento": nascimento}},
+        )
+        b = resp.json()
+        confere = bool(b.get("cpf_disponivel")) and \
+                  b.get("cpf_situacao_cadastral") == "REGULAR" and \
+                  b.get("nome") is True and b.get("data_nascimento") is True
+        # Auditoria: guardar apenas o veredito, NUNCA o valor consultado.
+        return CadastralResult(confere=confere, raw_flags=redact(b))
+```
+
+> **Importante para auditoria/LGPD**: persista o **veredito** e os booleanos,
+> nunca a imagem da selfie ou um eco do nome/nascimento "verdadeiro". O
+> objetivo é provar que a checagem ocorreu, não reter dado sensível.
+
+## 12. Modelo de dados (consentimento e auditoria)
+
+Princípios do modelo: **append-only** (registros nunca são alterados, só
+versionados), **pseudonimização** do titular nas trilhas e **separação** entre
+dado operacional (cifrado, com retenção curta) e trilha de auditoria (longa).
+
+### 12.1 `consent_record` — consentimento
+
+```
+consent_record
+─────────────────────────────────────────────────────────────
+id                UUID            PK
+subject_id        UUID            FK do titular (pseudônimo)
+scope             ENUM            'cadastral' | 'biometria'   (1 linha por escopo)
+granted           BOOLEAN         concedido (true) / revogado (false)
+policy_version    TEXT            versão do aviso de privacidade aceito
+terms_version     TEXT            versão do termo de consentimento aceito
+legal_basis       ENUM            'contrato' | 'obrigacao_legal' | 'consentimento'
+created_at        TIMESTAMPTZ     momento do aceite/revogação
+ip                INET            IP de origem
+device_id         TEXT            identificador do device
+user_agent        TEXT
+prev_id           UUID NULL       aponta para o registro anterior (cadeia)
+─────────────────────────────────────────────────────────────
+Regra: append-only. Revogar = inserir nova linha (granted=false),
+nunca UPDATE/DELETE. O estado atual é a última linha por (subject_id, scope).
+```
+
+Consentimento da **biometria** é **sempre** uma linha separada com
+`scope='biometria'` e `legal_basis='consentimento'` — não pode ser presumido
+junto com o cadastral.
+
+### 12.2 `kyc_verification` — execução e decisão
+
+```
+kyc_verification
+─────────────────────────────────────────────────────────────
+id                  UUID          PK
+subject_id          UUID          FK do titular (pseudônimo)
+status              ENUM          'aprovado' | 'em_revisao' | 'recusado'
+reason              TEXT          motivo legível (ex.: 'dados não conferem')
+decided_by          TEXT          'auto' | id do analista (revisão humana)
+cadastral_ok        BOOLEAN
+liveness_ok         BOOLEAN
+face_similarity     NUMERIC(4,3)  ex.: 0.930  (score, não a imagem)
+risk_flags          JSONB         { pep: false, sancoes: false, score: 870 }
+provider_refs       JSONB         ids de transação dos provedores (rastreio)
+consent_ref         UUID          FK do consent_record vigente no momento
+created_at          TIMESTAMPTZ
+─────────────────────────────────────────────────────────────
+Não armazena selfie, documento nem dado cadastral "verdadeiro".
+Guarda scores, booleanos e referências — suficiente para auditoria.
+```
+
+### 12.3 `audit_log` — trilha imutável
+
+```
+audit_log
+─────────────────────────────────────────────────────────────
+id            BIGSERIAL    PK
+event         TEXT         'kyc_start' | 'consent_granted' | 'kyc_decision' | ...
+subject_id    UUID         pseudônimo
+payload       JSONB        contexto mínimo do evento (sem dado sensível)
+created_at    TIMESTAMPTZ
+hash          TEXT         SHA-256(payload + hash_anterior)   ← encadeamento
+─────────────────────────────────────────────────────────────
+Hash encadeado (estilo ledger): qualquer adulteração de uma linha
+quebra a verificação das seguintes. Idealmente WORM/append-only no storage.
+```
+
+### 12.4 Dados efêmeros (imagens) — fora do banco principal
+
+- Selfie, frames de liveness e imagem do documento ficam em **storage cifrado
+  e separado**, com **TTL curto** (ex.: expira em minutos/horas após a decisão).
+- O banco principal guarda só **referências e vereditos**.
+- Ao aprovar/recusar, dispara-se o **purge** programado da biometria, salvo
+  obrigação legal de retenção — e isso fica registrado no `audit_log`.
+
+### 12.5 Mapa de retenção (exemplo)
+
+| Dado | Onde | Retenção |
+|---|---|---|
+| Selfie / documento (imagens) | Storage cifrado efêmero | Minutos–horas (purge pós-decisão) |
+| `face_similarity`, vereditos | `kyc_verification` | Conforme PLD (ex.: 5 anos) |
+| Consentimento | `consent_record` | Enquanto durar a relação + prazo legal |
+| Trilha de auditoria | `audit_log` | Prazo legal/regulatório |
+
+## 13. Checklist de conformidade antes de ir para produção
 
 - [ ] Aviso de privacidade e termo de consentimento (biometria em destaque).
 - [ ] DPA assinado com cada provedor (papel de operador definido).
